@@ -712,7 +712,7 @@ def render_side_console(
     inflation_rate: float,
     inflation_cost_share: float,
 ) -> None:
-    st.subheader("右側コンソール")
+    st.subheader("条件コンソール")
     with st.container(border=True):
         st.markdown("**ピア設定**")
         st.write(f"ピア件数: **{len(peers)}**")
@@ -816,7 +816,7 @@ def main() -> None:
             st.error("経営・人員パネルxlsxに '病院名称' 列が必要です。")
             st.stop()
 
-        main_col, console_col = st.columns([2.5, 1.0], gap="large")
+        main_col = st.container()
         with main_col:
             with st.expander("対象・申請人数の設定", expanded=True):
                 h1, h2, h3 = st.columns([1.4, 1.0, 1.0])
@@ -895,7 +895,8 @@ def main() -> None:
                     - 最終スコア = 人員不足解消、財務効果、粗利益持続性、政策必要性、労働市場逼迫度の加重平均
                     """)
 
-        with console_col:
+        with st.sidebar:
+            st.divider()
             render_side_console(
                 target, peers, peer_criteria, peer_applied, min_peers, result,
                 hire_type_selected, request_type_selected, revenue_impact_selected,
