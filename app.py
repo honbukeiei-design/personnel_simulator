@@ -262,6 +262,80 @@ def peer_group(
         return df_latest.copy(), []
     return peers, applied
 
+
+def selected_key(option_dict: Dict[str, object]) -> str:
+    """申請フォームのラジオ選択値を安全に取り出す。"""
+    if isinstance(option_dict, dict) and option_dict:
+        return next(iter(option_dict.keys()))
+    return ""
+
+
+def application_adjustments(hire_type: str, request_type: str, revenue_impact: str) -> Dict[str, float | str]:
+    """申請フォームの区分をシミュレーション係数へ反映する。
+
+    反映方針:
+    - 増収効果あり: 年間増収推計と財務スコアを加点
+    - 現状維持: 収益よりも医療提供体制維持・質安全の価値を厚く評価
+    - コスト増だが必要不可欠: 政策・質安全価値と人員不足解消を厚く評価しつつ、財務面は慎重に扱う
+    - 欠員補充: 新規の収益創出よりもサービス維持・採用難リスクを評価
+    - 採用区分未定: 実行可能性リスクとして少し減点
+    """
+    revenue_multiplier = 1.0
+    policy_weight_add = 0.0
+    labor_factor_add = 0.0
+    finance_score_bonus = 0.0
+    policy_score_bonus = 0.0
+    staff_gap_score_bonus = 0.0
+    execution_penalty = 0.0
+    notes: list[str] = []
+
+    if revenue_impact == "増収効果あり":
+        revenue_multiplier += 0.30
+        finance_score_bonus += 1.2
+        notes.append("収支影響=増収効果あり: 年間増収推計を30%上乗せし、財務スコアを加点")
+    elif revenue_impact == "現状維持":
+        policy_weight_add += 0.20
+        policy_score_bonus += 1.5
+        notes.append("収支影響=現状維持: 増収よりも医療提供体制維持として政策・質安全価値を加重")
+    elif revenue_impact == "コスト増だが必要不可欠":
+        policy_weight_add += 0.35
+        policy_score_bonus += 2.0
+        staff_gap_score_bonus += 0.8
+        revenue_multiplier *= 0.70
+        notes.append("収支影響=コスト増だが必要不可欠: 財務増収は控えめにし、必要不可欠性・人員不足解消を加点")
+
+    if request_type == "新規増員":
+        staff_gap_score_bonus += 0.4
+        notes.append("申請区分=新規増員: ピア不足解消の評価を小幅加点")
+    elif request_type == "欠員補充":
+        policy_weight_add += 0.10
+        labor_factor_add += 0.15
+        notes.append("申請区分=欠員補充: 現状維持・欠員長期化リスクを加味")
+    elif request_type == "その他":
+        policy_weight_add += 0.05
+        notes.append("申請区分=その他: 個別事情として政策価値を小幅加味")
+
+    if hire_type == "機構採用":
+        labor_factor_add += 0.05
+        notes.append("採用区分=機構採用: 広域採用調整の必要性として採用市場リスクを小幅加味")
+    elif hire_type == "病院採用":
+        execution_penalty -= 0.2
+        notes.append("採用区分=病院採用: 病院裁量で実行しやすい前提として小幅加点")
+    elif hire_type == "未定":
+        execution_penalty += 0.6
+        notes.append("採用区分=未定: 実行可能性が未確定のため最終スコアを減点")
+
+    return {
+        "revenue_multiplier": revenue_multiplier,
+        "policy_weight_add": policy_weight_add,
+        "labor_factor_add": labor_factor_add,
+        "finance_score_bonus": finance_score_bonus,
+        "policy_score_bonus": policy_score_bonus,
+        "staff_gap_score_bonus": staff_gap_score_bonus,
+        "execution_penalty": execution_penalty,
+        "notes": "\n".join(notes) if notes else "申請区分による補正なし",
+    }
+
 def simulate(
     target: pd.Series,
     peers: pd.DataFrame,
@@ -274,6 +348,9 @@ def simulate(
     labor_weight: float = 0.15,
     inflation_rate: float = 0.0,
     inflation_cost_share: float = 0.6,
+    hire_type: str = "",
+    request_type: str = "",
+    revenue_impact: str = "",
 ) -> Dict[str, float | str]:
     staff_col = STAFF_COL_BY_JOB.get(job, "看護師数")
     bed_count = float(target.get("病床数", np.nan) or np.nan)
@@ -290,6 +367,10 @@ def simulate(
     inflation = max(-0.05, min(0.20, float(inflation_rate)))
     inflation_share = max(0.0, min(1.0, float(inflation_cost_share)))
 
+    app_adj = application_adjustments(hire_type, request_type, revenue_impact)
+    effective_quality_weight = max(0.0, min(1.5, quality_weight + float(app_adj["policy_weight_add"])))
+    effective_labor_factor = max(0.0, min(1.0, labor_factor + float(app_adj["labor_factor_add"])))
+
     annual_cost_total_nominal = add_count * annual_cost
     annual_cost_total = annual_cost_total_nominal * (1 + inflation * inflation_share)
     revenue_base = float(target.get("修正医業収益_円", 0) or 0)
@@ -298,7 +379,8 @@ def simulate(
         closing_ratio = min(add_count / gap_to_peer, 1.0)
     else:
         closing_ratio = 0.0
-    annual_revenue_gain = revenue_base * revenue_sensitivity * closing_ratio
+    annual_revenue_gain_base = revenue_base * revenue_sensitivity * closing_ratio
+    annual_revenue_gain = annual_revenue_gain_base * float(app_adj["revenue_multiplier"])
 
     gross_profit = float(target.get("粗利益_円", np.nan) or np.nan)
     current_labor_cost = float(target.get("人件費_円", np.nan) or np.nan)
@@ -307,15 +389,15 @@ def simulate(
     gross_profit_cover_after = gross_profit_after_gain / after_labor_cost if pd.notna(gross_profit_after_gain) and after_labor_cost else np.nan
     gross_profit_margin_after = gross_profit_after_gain - after_labor_cost if pd.notna(gross_profit_after_gain) and pd.notna(after_labor_cost) else np.nan
 
-    policy_value = annual_cost_total * quality_weight
+    policy_value = annual_cost_total * effective_quality_weight
     # 労働市場逼迫価値：将来採用難化・紹介料増・欠員長期化のリスクをコスト換算で見える化。
-    labor_market_value = annual_cost_total * labor_weight * labor_factor
+    labor_market_value = annual_cost_total * labor_weight * effective_labor_factor
     net_financial = annual_revenue_gain - annual_cost_total
     net_with_policy = annual_revenue_gain + policy_value + labor_market_value - annual_cost_total
     roi_months = np.nan if annual_revenue_gain <= 0 else annual_cost_total / annual_revenue_gain * 12
 
-    score_staff_gap = 0 if pd.isna(gap_to_peer) else max(0, min(10, gap_to_peer / max(add_count, 1) * 5))
-    score_finance = max(0, min(10, (net_with_policy / max(annual_cost_total, 1) + 1) * 5)) if annual_cost_total else 0
+    score_staff_gap = 0 if pd.isna(gap_to_peer) else max(0, min(10, gap_to_peer / max(add_count, 1) * 5 + float(app_adj["staff_gap_score_bonus"])))
+    score_finance = max(0, min(10, (net_with_policy / max(annual_cost_total, 1) + 1) * 5 + float(app_adj["finance_score_bonus"]))) if annual_cost_total else 0
     if pd.isna(gross_profit_cover_after):
         score_sustainability = 5
         sustainability_label = "粗利益・人件費データ不足のため要確認"
@@ -331,16 +413,18 @@ def simulate(
     else:
         score_sustainability = 2
         sustainability_label = "慎重判断：粗利益による人件費支持が弱い"
-    score_policy = 8 if quality_weight >= 0.5 else (6 if quality_weight >= 0.25 else 4)
-    score_labor = labor_factor * 10
-    decision_score = round(
+    score_policy = 8 if effective_quality_weight >= 0.5 else (6 if effective_quality_weight >= 0.25 else 4)
+    score_policy = max(0, min(10, score_policy + float(app_adj["policy_score_bonus"])))
+    score_labor = effective_labor_factor * 10
+    raw_decision_score = (
         0.30 * score_staff_gap
         + 0.25 * score_finance
         + 0.25 * score_sustainability
         + 0.10 * score_policy
-        + 0.10 * score_labor,
-        1,
+        + 0.10 * score_labor
+        - float(app_adj["execution_penalty"])
     )
+    decision_score = round(max(0, min(10, raw_decision_score)), 1)
     if decision_score >= 7.5:
         recommendation = "承認候補：人員不足・粗利益持続性・政策/採用市場リスクを説明しやすい"
     elif decision_score >= 5.5:
@@ -358,6 +442,11 @@ def simulate(
         "年間人件費増_物価反映前": annual_cost_total_nominal,
         "年間人件費増": annual_cost_total,
         "年間増収推計": annual_revenue_gain,
+        "年間増収推計_申請補正前": annual_revenue_gain_base,
+        "申請補正_増収倍率": float(app_adj["revenue_multiplier"]),
+        "政策・質安全価値_実効重み": effective_quality_weight,
+        "労働市場逼迫度_実効値": effective_labor_factor,
+        "申請区分補正メモ": str(app_adj["notes"]),
         "現在粗利益": gross_profit,
         "現在人件費": current_labor_cost,
         "増員後粗利益": gross_profit_after_gain,
@@ -545,6 +634,10 @@ def main() -> None:
         else:
             st.caption(f"条件適用なし、または件数不足のため全体比較（n={len(peers)}）")
 
+        hire_type_selected = selected_key(app.get("採用区分_候補", {}))
+        request_type_selected = selected_key(app.get("申請区分_候補", {}))
+        revenue_impact_selected = selected_key(app.get("収支影響_候補", {}))
+
         if labor_mode == "判定に入れない":
             labor_shortage_factor = 0.0
         else:
@@ -556,6 +649,9 @@ def main() -> None:
             labor_weight=labor_weight,
             inflation_rate=inflation_rate,
             inflation_cost_share=inflation_cost_share,
+            hire_type=hire_type_selected,
+            request_type=request_type_selected,
+            revenue_impact=revenue_impact_selected,
         )
         st.divider()
         c1, c2, c3, c4 = st.columns(4)
@@ -565,6 +661,17 @@ def main() -> None:
         roi = result["ROI回収月数"]
         c4.metric("ROI回収月数", "算定不可" if pd.isna(roi) else f"{roi:.1f}か月")
         st.success(result["推奨判定"])
+        with st.expander("申請フォーム区分の反映内容", expanded=True):
+            st.write({
+                "採用区分": hire_type_selected or "未選択",
+                "申請区分": request_type_selected or "未選択",
+                "収支影響": revenue_impact_selected or "未選択",
+                "年間増収推計_補正前": result["年間増収推計_申請補正前"],
+                "増収補正倍率": result["申請補正_増収倍率"],
+                "政策・質安全価値_実効重み": result["政策・質安全価値_実効重み"],
+                "労働市場逼迫度_実効値": result["労働市場逼迫度_実効値"],
+            })
+            st.markdown(result["申請区分補正メモ"].replace("\n", "  \n"))
 
         c5, c6, c7, c8 = st.columns(4)
         c5.metric("現員", f"{result['現員']:.1f}人")
