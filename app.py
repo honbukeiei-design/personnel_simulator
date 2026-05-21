@@ -28,6 +28,9 @@ MHLW_BED_FUNCTION_TOP = "https://www.mhlw.go.jp/stf/seisakunitsuite/bunya/000005
 MHLW_R6_OPEN_DATA = "https://www.mhlw.go.jp/stf/seisakunitsuite/bunya/open_data_00018.html"
 MHLW_R6_CHUBU_WARD_STYLE1 = "https://www.mhlw.go.jp/content/10800000/001299895.xlsx"
 MHLW_R6_CHUBU_WARD_STYLE2_ANNUAL = "https://www.mhlw.go.jp/content/10800000/001299937.xlsx"
+JILPT_LABOR_FORCE_URL = "https://www.jil.go.jp/kokunai/statistics/timeseries/html/g0201.html"
+STAT_CPI_URL = "https://www.stat.go.jp/data/cpi/"
+STAT_CPI_LATEST_URL = "https://www.stat.go.jp/data/cpi/sokuhou/tsuki/index-z.html"
 
 JOB_MAP = {
     "医師": ["医師", "doctor", "physician"],
@@ -75,7 +78,7 @@ def load_financial_excel(file_bytes: bytes) -> pd.DataFrame:
     df = pd.read_excel(io.BytesIO(file_bytes))
     df.columns = [str(c).strip() for c in df.columns]
     numeric_candidates = [
-        "年度", "修正医業収益", "医業費用", "人件費", "医業利益", "経常利益", "病床数", "全職員数",
+        "年度", "修正医業収益", "医業費用", "人件費", "医薬品費", "医療材料費", "医業利益", "経常利益", "病床数", "全職員数",
         "事務職員数", "医師数", "看護師数", "医療スタッフ数", "その他職員数", "一日平均入院患者数", "一日平均外来患者数",
         "延べ入院患者数", "延べ外来患者数", "DPCフラグ", "地域医療支援病院フラグ", "Ta", "Da", "profit_deficit", "クラスタ",
     ]
@@ -194,9 +197,18 @@ def latest_rows(df: pd.DataFrame) -> pd.DataFrame:
 
 def add_core_metrics(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
-    for col in ["修正医業収益", "医業費用", "人件費", "医業利益", "経常利益"]:
+    # 添付データの金額列は千円単位を想定し、円換算列を追加する。
+    for col in ["修正医業収益", "医業費用", "人件費", "医薬品費", "医療材料費", "医業利益", "経常利益"]:
         if col in out.columns:
             out[col + "_円"] = out[col].map(yen_man_to_yen)
+
+    if {"修正医業収益_円", "医薬品費_円", "医療材料費_円"}.issubset(out.columns):
+        out["粗利益_円"] = out["修正医業収益_円"] - out["医薬品費_円"] - out["医療材料費_円"]
+    if {"粗利益_円", "人件費_円"}.issubset(out.columns):
+        out["粗利益人件費カバー率"] = safe_div(out["粗利益_円"], out["人件費_円"])
+        out["粗利益人件費余力_円"] = out["粗利益_円"] - out["人件費_円"]
+        out["人件費対粗利益率"] = safe_div(out["人件費_円"], out["粗利益_円"])
+
     if {"一日平均入院患者数", "病床数"}.issubset(out.columns):
         out["病床稼働率"] = safe_div(out["一日平均入院患者数"], out["病床数"])
     if {"全職員数", "病床数"}.issubset(out.columns):
@@ -212,7 +224,6 @@ def add_core_metrics(df: pd.DataFrame) -> pd.DataFrame:
         out["医業利益率_calc"] = safe_div(out["医業利益_円"], out["修正医業収益_円"])
     return out
 
-
 def fuzzy_pick_hospital(df: pd.DataFrame, applicant_dept: str = "", default_keyword: str = "長野県立") -> str:
     names = sorted(df["病院名称"].dropna().astype(str).unique()) if "病院名称" in df.columns else []
     if not names:
@@ -227,18 +238,43 @@ def fuzzy_pick_hospital(df: pd.DataFrame, applicant_dept: str = "", default_keyw
     return names[0]
 
 
-def peer_group(df_latest: pd.DataFrame, target_row: pd.Series) -> pd.DataFrame:
+def peer_group(
+    df_latest: pd.DataFrame,
+    target_row: pd.Series,
+    criteria: List[str] | None = None,
+    min_peers: int = 5,
+) -> Tuple[pd.DataFrame, List[str]]:
+    """選択された属性でピア群を絞り込む。
+
+    絞り込み過ぎて対象が少なくなると中央値が不安定になるため、各条件は
+    適用後に min_peers 以上残る場合だけ採用する。
+    """
+    criteria = criteria or ["クラスタ", "DPCフラグ", "過疎地区分", "小児フラグ", "精神科フラグ"]
     peers = df_latest.copy()
-    for col in ["クラスタ", "DPCフラグ", "精神科フラグ", "小児フラグ"]:
+    applied: List[str] = []
+    for col in criteria:
         if col in peers.columns and col in target_row.index and pd.notna(target_row.get(col)):
             subset = peers[peers[col] == target_row.get(col)]
-            if len(subset) >= 5:
+            if len(subset) >= min_peers:
                 peers = subset
-                break
-    return peers
+                applied.append(f"{col}={target_row.get(col)}")
+    if peers.empty:
+        return df_latest.copy(), []
+    return peers, applied
 
-
-def simulate(target: pd.Series, peers: pd.DataFrame, job: str, add_count: float, annual_cost: float, revenue_sensitivity: float, quality_weight: float) -> Dict[str, float | str]:
+def simulate(
+    target: pd.Series,
+    peers: pd.DataFrame,
+    job: str,
+    add_count: float,
+    annual_cost: float,
+    revenue_sensitivity: float,
+    quality_weight: float,
+    labor_shortage_factor: float = 0.0,
+    labor_weight: float = 0.15,
+    inflation_rate: float = 0.0,
+    inflation_cost_share: float = 0.6,
+) -> Dict[str, float | str]:
     staff_col = STAFF_COL_BY_JOB.get(job, "看護師数")
     bed_count = float(target.get("病床数", np.nan) or np.nan)
     current_staff = float(target.get(staff_col, np.nan) or np.nan)
@@ -249,31 +285,68 @@ def simulate(target: pd.Series, peers: pd.DataFrame, job: str, add_count: float,
     after_staff = current_staff + add_count if pd.notna(current_staff) else add_count
     after_ratio = after_staff / bed_count if bed_count else np.nan
 
-    annual_cost_total = add_count * annual_cost
+    # 労働市場が逼迫しているほど、今採用しないことの機会損失を大きく見る。
+    labor_factor = max(0.0, min(1.0, float(labor_shortage_factor)))
+    inflation = max(-0.05, min(0.20, float(inflation_rate)))
+    inflation_share = max(0.0, min(1.0, float(inflation_cost_share)))
+
+    annual_cost_total_nominal = add_count * annual_cost
+    annual_cost_total = annual_cost_total_nominal * (1 + inflation * inflation_share)
     revenue_base = float(target.get("修正医業収益_円", 0) or 0)
     med_income_per_day = float(target.get("入院患者1人日あたり医業収益_円", np.nan) or np.nan)
-    # 増員が収益化する場合：不足ギャップの改善度 × 感応度で収益増を控えめに推定。
     if pd.notna(gap_to_peer) and gap_to_peer > 0 and add_count > 0:
         closing_ratio = min(add_count / gap_to_peer, 1.0)
     else:
         closing_ratio = 0.0
     annual_revenue_gain = revenue_base * revenue_sensitivity * closing_ratio
-    # 医療政策・質安全価値：収益に直接出ない必要性も意思決定に載せるため、コスト換算の便益として別枠で表示。
+
+    gross_profit = float(target.get("粗利益_円", np.nan) or np.nan)
+    current_labor_cost = float(target.get("人件費_円", np.nan) or np.nan)
+    after_labor_cost = current_labor_cost + annual_cost_total if pd.notna(current_labor_cost) else np.nan
+    gross_profit_after_gain = gross_profit + annual_revenue_gain if pd.notna(gross_profit) else np.nan
+    gross_profit_cover_after = gross_profit_after_gain / after_labor_cost if pd.notna(gross_profit_after_gain) and after_labor_cost else np.nan
+    gross_profit_margin_after = gross_profit_after_gain - after_labor_cost if pd.notna(gross_profit_after_gain) and pd.notna(after_labor_cost) else np.nan
+
     policy_value = annual_cost_total * quality_weight
+    # 労働市場逼迫価値：将来採用難化・紹介料増・欠員長期化のリスクをコスト換算で見える化。
+    labor_market_value = annual_cost_total * labor_weight * labor_factor
     net_financial = annual_revenue_gain - annual_cost_total
-    net_with_policy = annual_revenue_gain + policy_value - annual_cost_total
+    net_with_policy = annual_revenue_gain + policy_value + labor_market_value - annual_cost_total
     roi_months = np.nan if annual_revenue_gain <= 0 else annual_cost_total / annual_revenue_gain * 12
 
     score_staff_gap = 0 if pd.isna(gap_to_peer) else max(0, min(10, gap_to_peer / max(add_count, 1) * 5))
     score_finance = max(0, min(10, (net_with_policy / max(annual_cost_total, 1) + 1) * 5)) if annual_cost_total else 0
-    score_policy = 8 if quality_weight >= 0.5 else (6 if quality_weight >= 0.25 else 4)
-    decision_score = round(0.45 * score_staff_gap + 0.35 * score_finance + 0.20 * score_policy, 1)
-    if decision_score >= 7.5:
-        recommendation = "承認候補：人員不足・収支/政策効果ともに説明しやすい"
-    elif decision_score >= 5.5:
-        recommendation = "条件付き承認候補：採用時期・人数・効果指標を明確化"
+    if pd.isna(gross_profit_cover_after):
+        score_sustainability = 5
+        sustainability_label = "粗利益・人件費データ不足のため要確認"
+    elif gross_profit_cover_after >= 1.15 and gross_profit_margin_after >= 0:
+        score_sustainability = 9
+        sustainability_label = "継続可能：粗利益で増員後人件費を概ね支えられる"
+    elif gross_profit_cover_after >= 1.0 and gross_profit_margin_after >= 0:
+        score_sustainability = 7
+        sustainability_label = "注意付き継続可能：余力は小さい"
+    elif gross_profit_cover_after >= 0.9:
+        score_sustainability = 4
+        sustainability_label = "要条件整理：粗利益で人件費を支える余力が不足気味"
     else:
-        recommendation = "再検討候補：効果仮説または配置計画の追加説明が必要"
+        score_sustainability = 2
+        sustainability_label = "慎重判断：粗利益による人件費支持が弱い"
+    score_policy = 8 if quality_weight >= 0.5 else (6 if quality_weight >= 0.25 else 4)
+    score_labor = labor_factor * 10
+    decision_score = round(
+        0.30 * score_staff_gap
+        + 0.25 * score_finance
+        + 0.25 * score_sustainability
+        + 0.10 * score_policy
+        + 0.10 * score_labor,
+        1,
+    )
+    if decision_score >= 7.5:
+        recommendation = "承認候補：人員不足・粗利益持続性・政策/採用市場リスクを説明しやすい"
+    elif decision_score >= 5.5:
+        recommendation = "条件付き承認候補：採用時期・人数・粗利益改善策・効果指標を明確化"
+    else:
+        recommendation = "再検討候補：効果仮説、配置計画、または人件費支持力の追加説明が必要"
 
     return {
         "現員": current_staff,
@@ -282,11 +355,20 @@ def simulate(target: pd.Series, peers: pd.DataFrame, job: str, add_count: float,
         "増員後_対病床": after_ratio,
         "ピア中央値_対病床": peer_median,
         "ピア中央値までの不足人数": gap_to_peer,
+        "年間人件費増_物価反映前": annual_cost_total_nominal,
         "年間人件費増": annual_cost_total,
         "年間増収推計": annual_revenue_gain,
+        "現在粗利益": gross_profit,
+        "現在人件費": current_labor_cost,
+        "増員後粗利益": gross_profit_after_gain,
+        "増員後人件費": after_labor_cost,
+        "増員後粗利益人件費カバー率": gross_profit_cover_after,
+        "増員後粗利益人件費余力": gross_profit_margin_after,
+        "粗利益持続性判定": sustainability_label,
         "政策・質安全価値": policy_value,
+        "労働市場逼迫価値": labor_market_value,
         "財務純効果": net_financial,
-        "政策価値込み純効果": net_with_policy,
+        "政策・労働市場価値込み純効果": net_with_policy,
         "ROI回収月数": roi_months,
         "意思決定スコア": decision_score,
         "推奨判定": recommendation,
@@ -391,6 +473,13 @@ def main() -> None:
         st.header("2. シミュレーション設定")
         revenue_sensitivity = st.slider("不足解消による年間増収感応度", 0.0, 0.10, 0.015, 0.005, help="ピア中央値までの不足を埋めた場合、医業収益が何%改善するかの仮説")
         quality_weight = st.slider("政策・質安全価値の重み", 0.0, 1.0, 0.35, 0.05, help="収益化しにくい安全・政策必要性を人件費に対する便益として別枠換算")
+        st.divider()
+        st.header("3. 外部環境の重み")
+        labor_mode = st.radio("労働市場の人手不足をどう扱うか", ["手動スライダー", "労働力トレンドを参考表示", "判定に入れない"], index=0)
+        labor_shortage_manual = st.slider("人手不足の逼迫度", 0.0, 1.0, 0.55, 0.05, help="1に近いほど採用難・欠員長期化リスクを強く評価")
+        labor_weight = st.slider("人手不足リスクの判定荷重", 0.0, 0.30, 0.15, 0.01)
+        inflation_rate = st.slider("物価上昇率・賃金上昇圧力", -0.02, 0.10, 0.026, 0.001, format="%.3f", help="人件費や委託費等の将来コスト上昇を反映。例：0.026 = 2.6%")
+        inflation_cost_share = st.slider("物価上昇を人件費増に反映する割合", 0.0, 1.0, 0.60, 0.05)
 
     financial_bytes = require_excel_bytes(
         read_file_bytes(financial_upload, DEFAULT_FINANCIAL_FILE),
@@ -445,8 +534,29 @@ def main() -> None:
                 "採用時期": app.get("採用時期") or "未記入",
             })
 
-        peers = peer_group(df_latest, target)
-        result = simulate(target, peers, job, add_count, annual_cost, revenue_sensitivity, quality_weight)
+        st.subheader("ピア設定")
+        available_peer_cols = [c for c in ["クラスタ", "DPCフラグ", "過疎地区分", "小児フラグ", "精神科フラグ", "都道府県名", "二次医療圏名"] if c in df_latest.columns]
+        default_peer_cols = [c for c in ["クラスタ", "過疎地区分", "小児フラグ", "精神科フラグ"] if c in available_peer_cols]
+        peer_criteria = st.multiselect("ピア抽出に使う属性", available_peer_cols, default=default_peer_cols, help="過疎地区分・小児フラグ・精神科フラグを含めて、対象病院と同じ属性の病院群に絞り込みます。")
+        min_peers = st.slider("ピア条件を採用する最小病院数", 3, 30, 5, 1)
+        peers, peer_applied = peer_group(df_latest, target, peer_criteria, min_peers=min_peers)
+        if peer_applied:
+            st.caption("適用されたピア条件: " + " / ".join(peer_applied) + f"（n={len(peers)}）")
+        else:
+            st.caption(f"条件適用なし、または件数不足のため全体比較（n={len(peers)}）")
+
+        if labor_mode == "判定に入れない":
+            labor_shortage_factor = 0.0
+        else:
+            labor_shortage_factor = labor_shortage_manual
+
+        result = simulate(
+            target, peers, job, add_count, annual_cost, revenue_sensitivity, quality_weight,
+            labor_shortage_factor=labor_shortage_factor,
+            labor_weight=labor_weight,
+            inflation_rate=inflation_rate,
+            inflation_cost_share=inflation_cost_share,
+        )
         st.divider()
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("意思決定スコア", f"{result['意思決定スコア']}/10")
@@ -460,7 +570,17 @@ def main() -> None:
         c5.metric("現員", f"{result['現員']:.1f}人")
         c6.metric("増員後", f"{result['増員後']:.1f}人")
         c7.metric("ピア中央値までの不足", "-" if pd.isna(result['ピア中央値までの不足人数']) else f"{result['ピア中央値までの不足人数']:.1f}人")
-        c8.metric("政策価値込み純効果", f"{result['政策価値込み純効果']:,.0f}円")
+        c8.metric("政策・労働市場価値込み純効果", f"{result['政策・労働市場価値込み純効果']:,.0f}円")
+
+        st.subheader("粗利益で人件費を支えられるか")
+        g1, g2, g3, g4 = st.columns(4)
+        g1.metric("現在粗利益", "-" if pd.isna(result['現在粗利益']) else f"{result['現在粗利益']:,.0f}円")
+        g2.metric("増員後人件費", "-" if pd.isna(result['増員後人件費']) else f"{result['増員後人件費']:,.0f}円")
+        cover = result['増員後粗利益人件費カバー率']
+        g3.metric("増員後 粗利益/人件費", "-" if pd.isna(cover) else f"{cover:.2f}倍")
+        margin = result['増員後粗利益人件費余力']
+        g4.metric("粗利益人件費余力", "-" if pd.isna(margin) else f"{margin:,.0f}円")
+        st.info(result['粗利益持続性判定'])
 
         comp = pd.DataFrame({
             "区分": ["対象病院 現在", "申請後", "ピア中央値"],
@@ -503,13 +623,20 @@ def main() -> None:
         st.markdown(
             """
             1. 添付の経営・人員パネルから、対象病院の最新年度を抽出します。  
-            2. クラスタ、DPC、精神科/小児など利用可能な属性からピア群を選び、職種別の「対病床人員」中央値を算定します。  
+            2. クラスタ、DPC、過疎地区分、小児フラグ、精神科フラグなど、UIで選んだ属性からピア群を作り、職種別の「対病床人員」中央値を算定します。  
             3. 申請人数により、対象病院の対病床人員がピア中央値にどれだけ近づくかを評価します。  
-            4. 財務効果は `医業収益 × 増収感応度 × 不足解消率 - 年間人件費増` で試算します。  
-            5. 政策・質安全価値は、収益化しにくい必要性を `年間人件費増 × 重み` として別枠表示します。  
-            6. 最終スコアは、人員不足解消・財務効果・政策必要性の加重平均です。係数は意思決定会議で調整してください。
+            4. 粗利益は `修正医業収益 -（医薬品費 + 医療材料費）` とし、増員後に粗利益で人件費を支えられるかを `粗利益 / 人件費` と余力額で判定します。  
+            5. 財務効果は `医業収益 × 増収感応度 × 不足解消率 - 物価反映後の年間人件費増` で試算します。  
+            6. 政策・質安全価値は、収益化しにくい必要性を `年間人件費増 × 重み` として別枠表示します。  
+            7. 労働市場の人手不足は、手動スライダーまたは労働力トレンドを参考にした荷重として、採用難・欠員長期化の機会損失に反映します。  
+            8. 物価上昇率・賃金上昇圧力は、将来コスト上昇として人件費増に反映します。  
+            9. 最終スコアは、人員不足解消・財務効果・粗利益持続性・政策必要性・労働市場逼迫度の加重平均です。係数は意思決定会議で調整してください。
             """
         )
+        st.subheader("外部統計の根拠URL")
+        st.markdown(f"- 労働力人口・労働力トレンド: {JILPT_LABOR_FORCE_URL}")
+        st.markdown(f"- 消費者物価指数（CPI）: {STAT_CPI_URL}")
+        st.markdown(f"- CPI最新月次結果: {STAT_CPI_LATEST_URL}")
         st.warning("このアプリは意思決定を支援する試算モデルです。最終判断では、施設基準、夜勤配置、地域医療構想、採用市場、予算制約を併せて確認してください。")
 
 
