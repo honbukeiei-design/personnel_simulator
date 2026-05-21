@@ -762,7 +762,7 @@ def render_side_console(
 
 def main() -> None:
     st.set_page_config(page_title=APP_TITLE, layout="wide")
-    st.title("🏥 病床機能・経営データ統合 人員要望意思決定支援")
+    st.title("職員人員要望意思決定支援シミュレーター")
     st.caption("経営・人員パネル、申請内容フォーム、厚生労働省 病床機能報告オープンデータを統合し、増員要望を病院別・職種別に評価します。")
 
     with st.sidebar:
